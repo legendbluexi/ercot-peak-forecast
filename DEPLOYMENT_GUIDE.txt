@@ -1,0 +1,116 @@
+# ERCOT Peak Price Forecast · Deployment Guide
+# ================================================
+# Total time: ~15 minutes. Totally free. No credit card needed.
+
+
+## WHAT YOU'LL END UP WITH
+A live website that shows projected on-peak DA and RT settlement prices
+for ERCOT North Hub for the next 7 days, driven by weather forecasts.
+
+URL will look like: https://your-username-ercot-peak-forecast.streamlit.app
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — Create a free GitHub account (skip if you have one)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Go to https://github.com
+2. Click "Sign up" in the top right
+3. Follow the prompts (free account is fine)
+4. Verify your email
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — Create a new repository on GitHub
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Once logged in, click the green "New" button on the left sidebar
+   (or go to https://github.com/new)
+2. Repository name: ercot-peak-forecast
+3. Set it to "Public"
+4. Check "Add a README file"
+5. Click "Create repository"
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3 — Upload your two files to GitHub
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+You have two files to upload: app.py and requirements.txt
+
+1. In your new repository, click "Add file" → "Upload files"
+2. Drag and drop BOTH files (app.py and requirements.txt) into the box
+3. Scroll down and click "Commit changes"
+
+That's it — your code is now on GitHub.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 4 — Create a free Streamlit account
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Go to https://share.streamlit.io
+2. Click "Sign up" and choose "Continue with GitHub"
+   (This links your GitHub so Streamlit can read your code)
+3. Authorize the connection when prompted
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 5 — Deploy the app
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. In Streamlit Community Cloud, click "New app"
+2. Fill in the fields:
+   - Repository: your-github-username/ercot-peak-forecast
+   - Branch: main
+   - Main file path: app.py
+3. Click "Deploy!"
+
+Streamlit will now install the packages and launch your app.
+This takes about 2–3 minutes the first time.
+
+Your app will be live at:
+https://[your-username]-ercot-peak-forecast-app-[random].streamlit.app
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHAT THE APP DOES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+On load, the app automatically:
+✓ Fetches 45 days of historical ERCOT North Hub DA and RT prices
+  from ERCOT's free public API (no account needed)
+✓ Fetches a 7-day hourly weather forecast for DFW from Open-Meteo
+  (also free, no API key needed)
+✓ Calculates projected on-peak (HE07–HE22) average DA and RT prices
+  for each of the next 7 days
+✓ Shows today's and tomorrow's headline prices vs 30-day historical avg
+✓ Color-coded risk alerts (LOW / MED / HIGH)
+✓ Weather icons and wind adjustments built in
+
+Data refreshes every 30 minutes automatically.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+UPDATING THE APP IN THE FUTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Any time you want to change something:
+1. Edit the app.py file on GitHub (click the file → pencil icon)
+2. Click "Commit changes"
+3. Streamlit automatically redeploys within ~60 seconds
+
+No need to touch anything else.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IMPORTANT NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+• Free Streamlit apps "sleep" after 7 days of no traffic.
+  Just visit the URL and it wakes back up in ~30 seconds.
+• ERCOT's public API occasionally changes endpoints.
+  If prices show "—", it means the API call failed; the weather
+  forecast will still work and model prices using default averages.
+• This is a statistical model, not a market oracle. Treat forecasts
+  as directional guidance, not trading signals.
