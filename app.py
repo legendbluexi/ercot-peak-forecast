@@ -5,6 +5,7 @@ import requests
 from datetime import datetime, timedelta
 import pytz
 import warnings
+import io
 warnings.filterwarnings("ignore")
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -18,9 +19,9 @@ st.set_page_config(
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
-html, body, [class*="css"]  { font-family: 'DM Sans', sans-serif; }
-.stApp                       { background: #F7F5F0; }
-#MainMenu, footer, header    { visibility: hidden; }
+html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
+.stApp { background: #F7F5F0; }
+#MainMenu, footer, header { visibility: hidden; }
 [data-testid="stMetricValue"] {
     font-family: 'Playfair Display', serif !important;
     font-size: 2.1rem !important;
@@ -31,13 +32,19 @@ html, body, [class*="css"]  { font-family: 'DM Sans', sans-serif; }
     text-transform: uppercase !important;
     letter-spacing: 0.08em !important;
 }
+/* Fix caption/small text rendering */
+.stCaption, [data-testid="stCaptionContainer"] p {
+    font-family: 'DM Sans', sans-serif !important;
+    font-size: 13px !important;
+    color: #555 !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 ERCOT_TZ   = pytz.timezone("US/Central")
 LAT, LON   = 32.90, -97.04
-PEAK_HOURS = list(range(7, 23))  # HE07–HE22
+PEAK_HOURS = list(range(7, 23))   # HE07–HE22  (7 am through 10 pm)
 
 TBL_STYLES = [
     {"selector": "th", "props": [
@@ -46,42 +53,53 @@ TBL_STYLES = [
         ("padding", "10px 12px"), ("font-family", "DM Sans, sans-serif"),
         ("letter-spacing", "0.05em"),
     ]},
-    {"selector": "td", "props": [("padding", "10px 14px"), ("text-align", "center")]},
+    {"selector": "td", "props": [
+        ("padding", "10px 14px"), ("text-align", "center"),
+        ("font-family", "DM Mono, monospace"), ("font-size", "13px"),
+    ]},
     {"selector": "tr:nth-child(even) td", "props": [("background-color", "#EEEBE4")]},
     {"selector": "tr:hover td", "props": [("background-color", "#E0DBD0")]},
 ]
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # COLOR HELPERS
-# Price bands:  < $35 = yellow  |  $35–$60 = yellow  |  $60–$100 = red  |  $100+ = purple
-# NEW ranges:   < $60 = yellow  |  $60–$100 = red  |  $100+ = purple
+# Power price scale:  <$35 light yellow | $35–$60 yellow | $60–$100 red | $100+ purple
 # ─────────────────────────────────────────────────────────────────────────────
 
 def color_price(val):
-    """Color scale for $/MWh power prices."""
     if not isinstance(val, (int, float)):
         return ""
     if val >= 100:
-        return "background-color:#E8D5F5;color:#4A0080;font-weight:600"   # purple
+        return "background-color:#E8D5F5;color:#4A0080;font-weight:600"
     if val >= 60:
-        return "background-color:#FFDAD4;color:#8B0000;font-weight:600"   # red
+        return "background-color:#FFDAD4;color:#8B0000;font-weight:600"
     if val >= 35:
-        return "background-color:#FFF3CC;color:#7A5000"                    # yellow
-    return "background-color:#FFFDE7;color:#5A4A00"                        # light yellow (very cheap)
+        return "background-color:#FFF3CC;color:#7A5000"
+    return "background-color:#FFFDE7;color:#5A4A00"
 
 
 def color_gas(val):
-    """Color scale for Henry Hub $/MMBtu."""
     if not isinstance(val, (int, float)):
         return ""
-    if val >= 4.0:
+    if val >= 5.0:
         return "background-color:#E8D5F5;color:#4A0080;font-weight:600"
-    if val >= 3.0:
+    if val >= 3.5:
         return "background-color:#FFDAD4;color:#8B0000"
-    if val >= 2.0:
+    if val >= 2.5:
         return "background-color:#FFF3CC;color:#7A5000"
     return "background-color:#FFFDE7;color:#5A4A00"
+
+
+def color_ratio(val):
+    if not isinstance(val, (int, float)):
+        return ""
+    if val >= 12:
+        return "background-color:#E8D5F5;color:#4A0080;font-weight:600"
+    if val >= 8:
+        return "background-color:#FFF3CC;color:#7A5000"
+    if val >= 5:
+        return ""
+    return "background-color:#DFF5E8;color:#1A5C35"
 
 
 def color_diff(val):
@@ -140,19 +158,12 @@ def fetch_historical_weather(year_offset: int):
 
 @st.cache_data(ttl=3600)
 def fetch_ercot_historical():
-    """
-    Fetch ~45 days of ERCOT North Hub DA + RT settlement prices.
-    Returns (df_or_None, status_message, da_rows_fetched, rt_rows_fetched).
-    """
     now      = datetime.now(ERCOT_TZ)
     start_dt = now - timedelta(days=45)
     prices   = []
-    da_count = 0
-    rt_count = 0
-    da_error = None
-    rt_error = None
+    da_count = rt_count = 0
+    da_error = rt_error = None
 
-    # ── Day-Ahead ──
     try:
         url = "https://api.ercot.com/api/public-reports/np4-190-cd/dam_stlmnt_pnt_prices"
         params = {
@@ -164,22 +175,20 @@ def fetch_ercot_historical():
         r = requests.get(url, params=params, timeout=15, headers={"Accept": "application/json"})
         if r.status_code == 200:
             data = r.json()
-            if "data" in data:
-                for row in data["data"]:
-                    try:
-                        dt = ERCOT_TZ.localize(
-                            datetime.strptime(f"{row[0]} {int(row[1])-1:02d}:00", "%Y-%m-%d %H:%M")
-                        )
-                        prices.append({"datetime": dt, "da_price": float(row[3]), "rt_price": None})
-                        da_count += 1
-                    except Exception:
-                        continue
+            for row in data.get("data", []):
+                try:
+                    dt = ERCOT_TZ.localize(
+                        datetime.strptime(f"{row[0]} {int(row[1])-1:02d}:00", "%Y-%m-%d %H:%M")
+                    )
+                    prices.append({"datetime": dt, "da_price": float(row[3]), "rt_price": None})
+                    da_count += 1
+                except Exception:
+                    continue
         else:
             da_error = f"HTTP {r.status_code}"
     except Exception as e:
         da_error = str(e)
 
-    # ── Real-Time ──
     rt_map = {}
     try:
         url_rt = "https://api.ercot.com/api/public-reports/np6-905-cd/spp_node_zone_hub"
@@ -192,16 +201,15 @@ def fetch_ercot_historical():
         r = requests.get(url_rt, params=params_rt, timeout=15, headers={"Accept": "application/json"})
         if r.status_code == 200:
             data = r.json()
-            if "data" in data:
-                for row in data["data"]:
-                    try:
-                        dt = ERCOT_TZ.localize(
-                            datetime.strptime(f"{row[0]} {int(row[1])-1:02d}:00", "%Y-%m-%d %H:%M")
-                        )
-                        rt_map[dt] = float(row[3])
-                        rt_count += 1
-                    except Exception:
-                        continue
+            for row in data.get("data", []):
+                try:
+                    dt = ERCOT_TZ.localize(
+                        datetime.strptime(f"{row[0]} {int(row[1])-1:02d}:00", "%Y-%m-%d %H:%M")
+                    )
+                    rt_map[dt] = float(row[3])
+                    rt_count += 1
+                except Exception:
+                    continue
         else:
             rt_error = f"HTTP {r.status_code}"
     except Exception as e:
@@ -213,53 +221,41 @@ def fetch_ercot_historical():
     if prices:
         df = pd.DataFrame(prices).dropna(subset=["da_price"])
         df = df.sort_values("datetime").reset_index(drop=True)
-        status = f"✅ Loaded {da_count} DA rows and {rt_count} RT rows from ERCOT API"
+        status = f"Connected — {da_count} DA rows and {rt_count} RT rows loaded"
         return df, status, da_count, rt_count
     else:
         errs = []
         if da_error: errs.append(f"DA: {da_error}")
         if rt_error: errs.append(f"RT: {rt_error}")
-        msg = "⚠️ ERCOT API returned no data. " + ("; ".join(errs) if errs else "Unknown error.")
+        msg = "API returned no data. " + ("; ".join(errs) if errs else "Unknown error.")
         return None, msg, 0, 0
 
 
 @st.cache_data(ttl=3600)
 def fetch_henry_hub():
     """
-    Fetch Henry Hub natural gas spot prices from the EIA free API.
-    Returns (df_or_None, status_message).
-    EIA series: NG.RNGWHHD.D  (Henry Hub Natural Gas Spot Price, Daily)
-    No API key needed for public series.
+    Pull Henry Hub daily spot prices from FRED (St. Louis Fed).
+    Series: DHHNGSP  — updated through prior business day, no API key needed.
+    URL pattern: https://fred.stlouisfed.org/graph/fredgraph.csv?id=DHHNGSP
     """
-    # EIA v2 API — no key required for public data
-    url = "https://api.eia.gov/v2/natural-gas/pri/fut/data/"
-    params = {
-        "frequency": "daily",
-        "data[0]": "value",
-        "facets[series][]": "RNGC1",   # Henry Hub front-month futures (public)
-        "sort[0][column]": "period",
-        "sort[0][direction]": "desc",
-        "length": 60,
-        "api_key": "DEMO_KEY",          # EIA demo key: 30 requests/hour, enough for this app
-    }
+    url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DHHNGSP"
     try:
-        r = requests.get(url, params=params, timeout=15)
-        if r.status_code == 200:
-            raw = r.json()
-            rows = raw.get("response", {}).get("data", [])
-            if rows:
-                df = pd.DataFrame(rows)[["period", "value"]].rename(
-                    columns={"period": "Date", "value": "HH Price ($/MMBtu)"}
-                )
-                df["HH Price ($/MMBtu)"] = pd.to_numeric(df["HH Price ($/MMBtu)"], errors="coerce")
-                df = df.dropna().sort_values("Date", ascending=False).reset_index(drop=True)
-                return df, f"✅ Loaded {len(df)} days of Henry Hub prices from EIA"
-            else:
-                return None, "⚠️ EIA returned empty data for Henry Hub"
-        else:
-            return None, f"⚠️ EIA API returned HTTP {r.status_code}"
+        r = requests.get(url, timeout=15,
+                         headers={"User-Agent": "Mozilla/5.0 (compatible; gridedge/1.0)"})
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        df.columns = ["Date", "HH Price ($/MMBtu)"]
+        df["HH Price ($/MMBtu)"] = pd.to_numeric(df["HH Price ($/MMBtu)"], errors="coerce")
+        df = df.dropna()
+        df = df.sort_values("Date", ascending=False).reset_index(drop=True)
+        # Keep last 90 days
+        cutoff = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+        df = df[df["Date"] >= cutoff]
+        latest_date = df["Date"].iloc[0] if len(df) > 0 else "unknown"
+        status = f"Connected — {len(df)} days loaded, most recent: {latest_date}"
+        return df, status
     except Exception as e:
-        return None, f"⚠️ Could not reach EIA API: {e}"
+        return None, f"FRED API error: {e}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,20 +319,21 @@ def build_forecast(weather_data, hist_df):
         is_tmrw   = date_str == (now_ct + timedelta(days=1)).strftime("%Y-%m-%d")
         day_label = "Today" if is_today else ("Tomorrow" if is_tmrw else date_obj.strftime("%A"))
 
-        if   max(da, rt) >= 100: alert = "🟣 VERY HIGH"
-        elif max(da, rt) >=  60: alert = "🔴 HIGH"
-        elif max(da, rt) >=  35: alert = "🟡 MODERATE"
-        else:                     alert = "🟡 LOW"
+        peak_val = max(da, rt)
+        if   peak_val >= 100: alert = "🟣 VERY HIGH"
+        elif peak_val >=  60: alert = "🔴 HIGH"
+        elif peak_val >=  35: alert = "🟡 MODERATE"
+        else:                  alert = "🟡 LOW-MOD"
 
         rows.append({
             "Day":                  day_label,
             "Date":                 date_obj.strftime("%b %d"),
             "Hi °F":                int(round(hi)),
             "Lo °F":                int(round(lo)),
-            "Avg Peak Temp (°F)":   round(pk_temp, 1),
-            "Wind (mph)":           int(round(pk_wind)),
-            "DA Forecast ($/MWh)":  da,
-            "RT Forecast ($/MWh)":  rt,
+            "Avg Peak Temp":        round(pk_temp, 1),
+            "Wind mph":             int(round(pk_wind)),
+            "DA $/MWh":             da,
+            "RT $/MWh":             rt,
             "Alert":                alert,
         })
 
@@ -344,10 +341,10 @@ def build_forecast(weather_data, hist_df):
 
 
 def build_weather_comparison(weather_data):
-    daily    = weather_data.get("daily", {})
-    dates    = daily.get("time", [])
-    hi_now   = daily.get("temperature_2m_max", [])
-    lo_now   = daily.get("temperature_2m_min", [])
+    daily  = weather_data.get("daily", {})
+    dates  = daily.get("time", [])
+    hi_now = daily.get("temperature_2m_max", [])
+    lo_now = daily.get("temperature_2m_min", [])
 
     hist_1 = fetch_historical_weather(1)
     hist_2 = fetch_historical_weather(2)
@@ -369,77 +366,65 @@ def build_weather_comparison(weather_data):
     now_ct = datetime.now(ERCOT_TZ)
     rows   = []
     for i, date_str in enumerate(dates[:7]):
-        date_obj  = datetime.strptime(date_str, "%Y-%m-%d")
-        is_today  = date_str == now_ct.strftime("%Y-%m-%d")
-        is_tmrw   = date_str == (now_ct + timedelta(days=1)).strftime("%Y-%m-%d")
-        day_lbl   = "Today" if is_today else ("Tomorrow" if is_tmrw else date_obj.strftime("%A"))
-        hi_this   = int(round(hi_now[i])) if i < len(hi_now) else None
-        lo_this   = int(round(lo_now[i])) if i < len(lo_now) else None
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+        is_today = date_str == now_ct.strftime("%Y-%m-%d")
+        is_tmrw  = date_str == (now_ct + timedelta(days=1)).strftime("%Y-%m-%d")
+        day_lbl  = "Today" if is_today else ("Tomorrow" if is_tmrw else date_obj.strftime("%A"))
+        hi_this  = int(round(hi_now[i])) if i < len(hi_now) else None
+        lo_this  = int(round(lo_now[i])) if i < len(lo_now) else None
         hi_1, lo_1 = get_hi_lo(hist_1, i)
         hi_2, lo_2 = get_hi_lo(hist_2, i)
         hi_3, lo_3 = get_hi_lo(hist_3, i)
         yr = date_obj.year
 
         rows.append({
-            "Day":             day_lbl,
-            "Date":            date_obj.strftime("%b %d"),
-            "Forecast Hi/Lo":  f"{hi_this}° / {lo_this}°" if hi_this else "—",
-            f"{yr-1} Hi/Lo":   f"{int(hi_1)}° / {int(lo_1)}°" if hi_1 else "N/A",
-            f"vs {yr-1}":      diff_str(hi_this, hi_1),
-            f"{yr-2} Hi/Lo":   f"{int(hi_2)}° / {int(lo_2)}°" if hi_2 else "N/A",
-            f"vs {yr-2}":      diff_str(hi_this, hi_2),
-            f"{yr-3} Hi/Lo":   f"{int(hi_3)}° / {int(lo_3)}°" if hi_3 else "N/A",
-            f"vs {yr-3}":      diff_str(hi_this, hi_3),
+            "Day":              day_lbl,
+            "Date":             date_obj.strftime("%b %d"),
+            "Forecast Hi / Lo": f"{hi_this}° / {lo_this}°" if hi_this else "—",
+            f"{yr-1} Hi / Lo":  f"{int(hi_1)}° / {int(lo_1)}°" if hi_1 else "N/A",
+            f"vs {yr-1}":       diff_str(hi_this, hi_1),
+            f"{yr-2} Hi / Lo":  f"{int(hi_2)}° / {int(lo_2)}°" if hi_2 else "N/A",
+            f"vs {yr-2}":       diff_str(hi_this, hi_2),
+            f"{yr-3} Hi / Lo":  f"{int(hi_3)}° / {int(lo_3)}°" if hi_3 else "N/A",
+            f"vs {yr-3}":       diff_str(hi_this, hi_3),
         })
 
     return pd.DataFrame(rows)
 
 
 def build_gas_power_comparison(hist_df, gas_df):
-    """
-    Merge daily on-peak power prices with Henry Hub gas prices on the same dates.
-    Shows correlation table: Date | DA Avg | RT Avg | HH Gas | DA/Gas Ratio | RT/Gas Ratio
-    """
-    if hist_df is None or gas_df is None:
+    if hist_df is None or gas_df is None or len(gas_df) == 0:
         return None
 
     hc = hist_df.copy()
     hc["hour"] = hc["datetime"].apply(lambda x: x.hour)
     hc["Date"] = hc["datetime"].apply(lambda x: x.strftime("%Y-%m-%d"))
     pk = hc[hc["hour"].isin(PEAK_HOURS)].copy()
-
     if len(pk) == 0:
         return None
 
     daily_power = (
         pk.groupby("Date")
-        .agg(
-            **{"DA Avg ($/MWh)": ("da_price", "mean"),
-               "RT Avg ($/MWh)": ("rt_price", "mean")}
-        )
+        .agg(**{
+            "DA Avg $/MWh": ("da_price", "mean"),
+            "RT Avg $/MWh": ("rt_price", "mean"),
+        })
         .reset_index()
     )
-    daily_power["DA Avg ($/MWh)"] = daily_power["DA Avg ($/MWh)"].round(2)
-    daily_power["RT Avg ($/MWh)"] = daily_power["RT Avg ($/MWh)"].round(2)
+    daily_power["DA Avg $/MWh"] = daily_power["DA Avg $/MWh"].round(2)
+    daily_power["RT Avg $/MWh"] = daily_power["RT Avg $/MWh"].round(2)
 
-    gas_df2 = gas_df.rename(columns={"Date": "Date", "HH Price ($/MMBtu)": "HH Gas ($/MMBtu)"})
-
-    merged = daily_power.merge(gas_df2[["Date","HH Gas ($/MMBtu)"]], on="Date", how="left")
-    merged["HH Gas ($/MMBtu)"] = merged["HH Gas ($/MMBtu)"].round(3)
-
-    # Heat rate implied = DA price / gas price  (higher = power expensive vs gas)
-    merged["DA/Gas Ratio (MWh/MMBtu)"] = (
-        merged["DA Avg ($/MWh)"] / merged["HH Gas ($/MMBtu)"]
-    ).round(2)
-    merged["RT/Gas Ratio (MWh/MMBtu)"] = (
-        merged["RT Avg ($/MWh)"] / merged["HH Gas ($/MMBtu)"]
-    ).round(2)
+    gas_renamed = gas_df.rename(columns={"HH Price ($/MMBtu)": "HH Gas $/MMBtu"})
+    merged = daily_power.merge(gas_renamed[["Date","HH Gas $/MMBtu"]], on="Date", how="left")
+    merged["HH Gas $/MMBtu"] = merged["HH Gas $/MMBtu"].round(3)
+    merged["DA/Gas Ratio"] = (merged["DA Avg $/MWh"] / merged["HH Gas $/MMBtu"]).round(2)
+    merged["RT/Gas Ratio"] = (merged["RT Avg $/MWh"] / merged["HH Gas $/MMBtu"]).round(2)
 
     return merged.sort_values("Date", ascending=False).reset_index(drop=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN APP
+# MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -447,12 +432,16 @@ def main():
 
     # ── Header ───────────────────────────────────────────────────────────────
     c1, c2, c3 = st.columns([2, 5, 2])
-    with c1: st.markdown("### ⚡ GRIDEDGE")
-    with c2: st.caption("ERCOT NORTH HUB  ·  SETTLEMENT PRICE INTELLIGENCE")
-    with c3: st.caption(now_ct.strftime("%b %d, %Y  ·  %I:%M %p CT"))
+    with c1:
+        st.markdown("### ⚡ GRIDEDGE")
+    with c2:
+        st.markdown("<p style='font-family:DM Mono,monospace;font-size:12px;color:#888;margin-top:14px;letter-spacing:0.08em'>ERCOT NORTH HUB · SETTLEMENT PRICE INTELLIGENCE</p>", unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"<p style='font-family:DM Mono,monospace;font-size:12px;color:#888;margin-top:14px;text-align:right'>{now_ct.strftime('%b %d, %Y · %I:%M %p CT')}</p>", unsafe_allow_html=True)
+
     st.divider()
     st.markdown("## Peak Hour Price Forecast")
-    st.caption("Projected on-peak (HE07–HE22) Day-Ahead and Real-Time settlement prices · ERCOT North Hub · $/MWh")
+    st.markdown("<p style='font-size:14px;color:#555;margin-top:-12px'>Projected on-peak (HE07–HE22) Day-Ahead and Real-Time settlement prices · ERCOT North Hub · $/MWh</p>", unsafe_allow_html=True)
     st.divider()
 
     # ── Load all data ─────────────────────────────────────────────────────────
@@ -462,23 +451,36 @@ def main():
         gas_df, gas_status = fetch_henry_hub()
 
     if weather_data is None:
-        st.error(f"⚠️ Could not reach weather API. {weather_err}  Please refresh.")
+        st.error(f"Could not reach weather API: {weather_err}. Please refresh.")
         return
 
-    # ── Data status banner ────────────────────────────────────────────────────
-    with st.expander("📡 Data Source Status", expanded=False):
-        st.markdown(f"**Weather (Open-Meteo):** ✅ Connected — 7-day forecast loaded for DFW ({LAT}°N, {LON}°W)")
-        st.markdown(f"**ERCOT North Hub Prices:** {ercot_status}")
-        if da_count > 0:
-            st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;↳ DA Settlement rows: **{da_count}** &nbsp;|&nbsp; RT Settlement rows: **{rt_count}**")
-        st.markdown(f"**Henry Hub Gas (EIA):** {gas_status}")
-        st.markdown("*All data sources are free public APIs requiring no API keys.*")
+    # ── Data status panel ─────────────────────────────────────────────────────
+    with st.expander("📡 Data Source Status — click to expand", expanded=False):
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            st.markdown("**🌤 Weather · Open-Meteo**")
+            if weather_data:
+                st.success("Connected — 7-day hourly forecast loaded")
+            else:
+                st.error(f"Failed: {weather_err}")
+        with col_s2:
+            st.markdown("**⚡ ERCOT North Hub · Public API**")
+            if da_count > 0:
+                st.success(ercot_status)
+            else:
+                st.warning(ercot_status)
+        with col_s3:
+            st.markdown("**🔥 Henry Hub Gas · FRED (St. Louis Fed)**")
+            if gas_df is not None:
+                st.success(gas_status)
+            else:
+                st.warning(gas_status)
+        st.markdown("<p style='font-size:12px;color:#888'>All sources are free public APIs — no API keys required. Data cached 30–60 min.</p>", unsafe_allow_html=True)
 
     # ── Build model outputs ───────────────────────────────────────────────────
     forecast_df = build_forecast(weather_data, hist_df)
     weather_cmp = build_weather_comparison(weather_data)
 
-    # Baseline from history
     hist_da_avg = hist_rt_avg = None
     if hist_df is not None and len(hist_df) > 0:
         hc = hist_df.copy()
@@ -497,78 +499,106 @@ def main():
     today    = forecast_df.iloc[0]
     tomorrow = forecast_df.iloc[1] if len(forecast_df) > 1 else None
 
+    # Latest gas price for metric
+    latest_gas = None
+    latest_gas_date = None
+    if gas_df is not None and len(gas_df) > 0:
+        latest_gas      = round(float(gas_df["HH Price ($/MMBtu)"].iloc[0]), 3)
+        latest_gas_date = gas_df["Date"].iloc[0]
+
     # ── Metric tiles ──────────────────────────────────────────────────────────
     m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.metric("Today · DA Peak ($/MWh)",
-                  f"${today['DA Forecast ($/MWh)']:.2f}",
-                  delta_str(today["DA Forecast ($/MWh)"], hist_da_avg))
+        st.metric(
+            "Today — DA Peak",
+            f"${today['DA $/MWh']:.2f} /MWh",
+            delta_str(today["DA $/MWh"], hist_da_avg),
+        )
     with m2:
-        st.metric("Today · RT Peak ($/MWh)",
-                  f"${today['RT Forecast ($/MWh)']:.2f}",
-                  delta_str(today["RT Forecast ($/MWh)"], hist_rt_avg))
+        st.metric(
+            "Today — RT Peak",
+            f"${today['RT $/MWh']:.2f} /MWh",
+            delta_str(today["RT $/MWh"], hist_rt_avg),
+        )
     with m3:
         if tomorrow is not None:
-            st.metric("Tomorrow · DA Peak ($/MWh)",
-                      f"${tomorrow['DA Forecast ($/MWh)']:.2f}",
-                      delta_str(tomorrow["DA Forecast ($/MWh)"], hist_da_avg))
+            st.metric(
+                "Tomorrow — DA Peak",
+                f"${tomorrow['DA $/MWh']:.2f} /MWh",
+                delta_str(tomorrow["DA $/MWh"], hist_da_avg),
+            )
     with m4:
-        if hist_da_avg:
-            st.metric("45-Day Avg Peak DA ($/MWh)", f"${hist_da_avg:.2f}",
+        if latest_gas is not None:
+            st.metric(
+                f"Henry Hub Gas ({latest_gas_date})",
+                f"${latest_gas:.3f} /MMBtu",
+                f"45-day DA avg: ${hist_da_avg:.2f}/MWh" if hist_da_avg else None,
+                delta_color="off",
+            )
+        elif hist_da_avg:
+            st.metric("45-Day Avg Peak DA", f"${hist_da_avg:.2f} /MWh",
                       "Historical baseline · on-peak hrs only", delta_color="off")
-        elif gas_df is not None:
-            latest_gas = gas_df["HH Price ($/MMBtu)"].iloc[0]
-            st.metric("Henry Hub Gas (latest)", f"${latest_gas:.3f}/MMBtu",
-                      "Front-month futures · EIA", delta_color="off")
-        else:
-            st.metric("45-Day Avg Peak DA", "ERCOT API Offline")
 
     st.divider()
 
     # ── 7-Day Price Forecast ──────────────────────────────────────────────────
     st.markdown("### 📋 7-Day Price Forecast")
-    st.caption(
-        "On-peak hours only (HE07–HE22 = 7 am–10 pm CT)  ·  "
-        "🟡 Under $60  ·  🔴 $60–$100  ·  🟣 Over $100"
+    # Color legend as styled markdown — no caption font issues
+    st.markdown(
+        "<p style='font-size:13px;color:#555;font-family:DM Sans,sans-serif'>"
+        "On-peak hours only (HE07–HE22 = 7 am – 10 pm CT) &nbsp;·&nbsp; "
+        "<span style='background:#FFFDE7;color:#5A4A00;padding:2px 6px;border-radius:3px'>🟡 Under $35</span> &nbsp;"
+        "<span style='background:#FFF3CC;color:#7A5000;padding:2px 6px;border-radius:3px'>🟡 $35 – $60</span> &nbsp;"
+        "<span style='background:#FFDAD4;color:#8B0000;padding:2px 6px;border-radius:3px'>🔴 $60 – $100</span> &nbsp;"
+        "<span style='background:#E8D5F5;color:#4A0080;padding:2px 6px;border-radius:3px'>🟣 Over $100</span>"
+        "</p>",
+        unsafe_allow_html=True,
     )
 
-    price_cols = ["DA Forecast ($/MWh)", "RT Forecast ($/MWh)"]
+    price_cols = ["DA $/MWh", "RT $/MWh"]
     styled_fc = (
         forecast_df.style
         .applymap(color_price, subset=price_cols)
-        .format({
-            "DA Forecast ($/MWh)": "${:.2f}",
-            "RT Forecast ($/MWh)": "${:.2f}",
-            "Avg Peak Temp (°F)":  "{:.1f}",
-        })
+        .format({"DA $/MWh": "${:.2f}", "RT $/MWh": "${:.2f}", "Avg Peak Temp": "{:.1f}°F"})
         .set_table_styles(TBL_STYLES)
-        .set_properties(**{"font-family": "DM Mono, monospace", "font-size": "14px"})
+        .set_properties(**{"font-family": "DM Mono, monospace", "font-size": "13px"})
     )
     st.dataframe(styled_fc, use_container_width=True, hide_index=True)
 
     st.divider()
 
     # ── Weather Comparison ────────────────────────────────────────────────────
-    st.markdown("### 🌡️ DFW Weather Outlook — vs. Same Week in Prior Years")
-    st.caption("Compares this week's forecast high to same calendar dates 1, 2, and 3 years ago.  🔴 = warmer than prior year  ·  🟢 = cooler")
+    st.markdown("### 🌡️ DFW Weather — Forecast vs. Same Week in Prior Years")
+    st.markdown(
+        "<p style='font-size:13px;color:#555;font-family:DM Sans,sans-serif'>"
+        "Compares this week's forecast high temp to the same calendar dates 1, 2, and 3 years ago. &nbsp;"
+        "<span style='color:#C03A00;font-weight:600'>Red = warmer than prior year</span> &nbsp;·&nbsp; "
+        "<span style='color:#1A7A3C;font-weight:600'>Green = cooler</span>"
+        "</p>",
+        unsafe_allow_html=True,
+    )
 
-    diff_cols   = [c for c in weather_cmp.columns if c.startswith("vs ")]
-    styled_wc   = (
+    diff_cols = [c for c in weather_cmp.columns if c.startswith("vs ")]
+    styled_wc = (
         weather_cmp.style
         .applymap(color_diff, subset=diff_cols)
         .set_table_styles(TBL_STYLES)
-        .set_properties(**{"font-family": "DM Mono, monospace", "font-size": "14px"})
+        .set_properties(**{"font-family": "DM Mono, monospace", "font-size": "13px"})
     )
     st.dataframe(styled_wc, use_container_width=True, hide_index=True)
 
     st.divider()
 
     # ── Historical Power Prices ───────────────────────────────────────────────
-    st.markdown("### 📊 Historical On-Peak Settlement Prices — Last 45 Days")
+    st.markdown("### 📊 Historical On-Peak Power Prices — Last 45 Days")
 
     if hist_df is not None and len(hist_df) > 0:
-        st.caption(f"Actual ERCOT North Hub on-peak (HE07–HE22) settlement prices.  {da_count} DA rows · {rt_count} RT rows loaded.")
-
+        st.markdown(
+            f"<p style='font-size:13px;color:#555;font-family:DM Sans,sans-serif'>"
+            f"Actual ERCOT North Hub on-peak (HE07–HE22) settlement prices. "
+            f"{da_count} DA rows and {rt_count} RT rows loaded from ERCOT Public API.</p>",
+            unsafe_allow_html=True,
+        )
         hc = hist_df.copy()
         hc["hour"] = hc["datetime"].apply(lambda x: x.hour)
         hc["Date"] = hc["datetime"].apply(lambda x: x.strftime("%Y-%m-%d"))
@@ -578,78 +608,76 @@ def main():
             daily_hist = (
                 pk.groupby("Date")
                 .agg(**{
-                    "DA Avg ($/MWh)": ("da_price", "mean"),
-                    "DA Max ($/MWh)": ("da_price", "max"),
-                    "RT Avg ($/MWh)": ("rt_price", "mean"),
-                    "RT Max ($/MWh)": ("rt_price", "max"),
+                    "DA Avg $/MWh": ("da_price", "mean"),
+                    "DA Max $/MWh": ("da_price", "max"),
+                    "RT Avg $/MWh": ("rt_price", "mean"),
+                    "RT Max $/MWh": ("rt_price", "max"),
                 })
                 .reset_index()
                 .sort_values("Date", ascending=False)
             )
-            for col in ["DA Avg ($/MWh)", "DA Max ($/MWh)", "RT Avg ($/MWh)", "RT Max ($/MWh)"]:
+            for col in ["DA Avg $/MWh","DA Max $/MWh","RT Avg $/MWh","RT Max $/MWh"]:
                 daily_hist[col] = daily_hist[col].round(2)
 
-            hist_price_cols = ["DA Avg ($/MWh)", "DA Max ($/MWh)", "RT Avg ($/MWh)", "RT Max ($/MWh)"]
+            hist_price_cols = ["DA Avg $/MWh","DA Max $/MWh","RT Avg $/MWh","RT Max $/MWh"]
             styled_hist = (
                 daily_hist.style
                 .applymap(color_price, subset=hist_price_cols)
                 .format({c: "${:.2f}" for c in hist_price_cols})
                 .set_table_styles(TBL_STYLES)
-                .set_properties(**{"font-family": "DM Mono, monospace", "font-size": "14px"})
+                .set_properties(**{"font-family": "DM Mono, monospace", "font-size": "13px"})
             )
             st.dataframe(styled_hist, use_container_width=True, hide_index=True)
     else:
         st.warning(
-            "⚠️ ERCOT API did not return price data.  "
-            "This can happen when the API is temporarily down or rate-limiting.  "
-            "The forecast above is using default baseline prices ($45 DA / $47 RT).  "
-            "Try clicking the refresh button in your browser — data usually comes back within a few minutes."
+            "ERCOT API returned no price data right now — this is usually temporary. "
+            "The price forecast above is using default baseline prices ($45 DA / $47 RT) until live data comes back. "
+            "Try refreshing the page in a few minutes."
         )
 
     st.divider()
 
     # ── Henry Hub Gas Prices ──────────────────────────────────────────────────
-    st.markdown("### 🔥 Henry Hub Natural Gas Prices — Last 60 Days")
+    st.markdown("### 🔥 Henry Hub Natural Gas Spot Prices — Last 90 Days")
 
     if gas_df is not None and len(gas_df) > 0:
-        st.caption(
-            "Henry Hub front-month natural gas futures ($/MMBtu).  Source: EIA.  "
-            "Gas is the marginal fuel setting ERCOT prices ~70–80% of peak hours."
+        st.markdown(
+            "<p style='font-size:13px;color:#555;font-family:DM Sans,sans-serif'>"
+            "Daily Henry Hub natural gas spot prices ($/MMBtu). Source: FRED / St. Louis Fed (EIA series DHHNGSP). "
+            "Gas sets the marginal price in ERCOT ~70–80% of on-peak hours. "
+            "January 2026 avg was $7.72/MMBtu — highest since Sept 2022 — driven by Winter Storm Fern."
+            "</p>",
+            unsafe_allow_html=True,
         )
         styled_gas = (
-            gas_df.head(60).style
+            gas_df.head(90).style
             .applymap(color_gas, subset=["HH Price ($/MMBtu)"])
             .format({"HH Price ($/MMBtu)": "${:.3f}"})
             .set_table_styles(TBL_STYLES)
-            .set_properties(**{"font-family": "DM Mono, monospace", "font-size": "14px"})
+            .set_properties(**{"font-family": "DM Mono, monospace", "font-size": "13px"})
         )
         st.dataframe(styled_gas, use_container_width=True, hide_index=True)
     else:
-        st.warning(gas_status)
+        st.warning(f"Henry Hub data unavailable: {gas_status}")
 
     st.divider()
 
     # ── Gas vs Power Correlation ──────────────────────────────────────────────
-    st.markdown("### ⚡ vs 🔥 Power vs. Gas — Implied Heat Rate Table")
-    st.caption(
-        "Compares daily on-peak power prices to Henry Hub gas on the same date.  "
-        "The DA/Gas ratio is the implied heat rate (MWh per MMBtu) — a heat rate above ~7–9 means "
-        "power is expensive relative to gas (gas plants earning good margins).  "
-        "Below ~6 means power is cheap vs gas."
+    st.markdown("### ⚡ Power vs. Gas — Implied Heat Rate Table")
+    st.markdown(
+        "<p style='font-size:13px;color:#555;font-family:DM Sans,sans-serif'>"
+        "DA/Gas Ratio = implied heat rate ($/MWh ÷ $/MMBtu). A ratio above ~8–9x means power is expensive "
+        "relative to gas (good margins for gas generators). Below ~6x means power is cheap vs fuel cost. "
+        "Normal ERCOT on-peak implied heat rates run 8–12x in summer."
+        "</p>",
+        unsafe_allow_html=True,
     )
 
     comp_df = build_gas_power_comparison(hist_df, gas_df)
     if comp_df is not None and len(comp_df) > 0:
-        ratio_cols  = ["DA/Gas Ratio (MWh/MMBtu)", "RT/Gas Ratio (MWh/MMBtu)"]
-        power_cols2 = ["DA Avg ($/MWh)", "RT Avg ($/MWh)"]
-        gas_col     = ["HH Gas ($/MMBtu)"]
-
-        def color_ratio(val):
-            if not isinstance(val, (int, float)): return ""
-            if val >= 10: return "background-color:#E8D5F5;color:#4A0080;font-weight:600"
-            if val >= 7:  return "background-color:#FFF3CC;color:#7A5000"
-            if val >= 5:  return ""
-            return "background-color:#DFF5E8;color:#1A5C35"
+        power_cols2 = ["DA Avg $/MWh", "RT Avg $/MWh"]
+        ratio_cols  = ["DA/Gas Ratio", "RT/Gas Ratio"]
+        gas_col     = ["HH Gas $/MMBtu"]
 
         styled_comp = (
             comp_df.style
@@ -657,30 +685,38 @@ def main():
             .applymap(color_gas,    subset=gas_col)
             .applymap(color_ratio,  subset=ratio_cols)
             .format({
-                "DA Avg ($/MWh)":            "${:.2f}",
-                "RT Avg ($/MWh)":            "${:.2f}",
-                "HH Gas ($/MMBtu)":          "${:.3f}",
-                "DA/Gas Ratio (MWh/MMBtu)":  "{:.2f}x",
-                "RT/Gas Ratio (MWh/MMBtu)":  "{:.2f}x",
+                "DA Avg $/MWh":   "${:.2f}",
+                "RT Avg $/MWh":   "${:.2f}",
+                "HH Gas $/MMBtu": "${:.3f}",
+                "DA/Gas Ratio":   "{:.2f}x",
+                "RT/Gas Ratio":   "{:.2f}x",
             })
             .set_table_styles(TBL_STYLES)
-            .set_properties(**{"font-family": "DM Mono, monospace", "font-size": "14px"})
+            .set_properties(**{"font-family": "DM Mono, monospace", "font-size": "13px"})
         )
         st.dataframe(styled_comp, use_container_width=True, hide_index=True)
     else:
-        st.info("ℹ️ Gas vs. power comparison requires both ERCOT and EIA data to be available.")
+        st.info("Gas vs. power comparison requires both ERCOT and EIA/FRED data to be available simultaneously.")
 
     st.divider()
 
     # ── Footer ────────────────────────────────────────────────────────────────
     f1, f2 = st.columns([4, 1])
     with f1:
-        st.caption(
-            "Data: ERCOT Public API · EIA (Henry Hub) · Open-Meteo  ·  "
-            "All free public APIs, no keys required  ·  "
-            f"Last updated {now_ct.strftime('%b %d, %Y %I:%M %p CT')}  ·  Refreshes every 30 min"
+        st.markdown(
+            "<p style='font-size:12px;color:#888;font-family:DM Mono,monospace'>"
+            "Sources: ERCOT Public API · FRED St. Louis Fed (EIA DHHNGSP) · Open-Meteo Forecast & Archive · "
+            "All free, no API keys · Prices cached 30–60 min · "
+            f"Last loaded {now_ct.strftime('%b %d, %Y %I:%M %p CT')}"
+            "</p>",
+            unsafe_allow_html=True,
         )
-        st.caption("⚠️ Statistical estimates only. Not a substitute for professional market analysis or trading signals.")
+        st.markdown(
+            "<p style='font-size:12px;color:#aaa;font-family:DM Mono,monospace'>"
+            "Statistical estimates only — not a substitute for professional market analysis or trading signals."
+            "</p>",
+            unsafe_allow_html=True,
+        )
     with f2:
         st.markdown("**⚡ GRIDEDGE**")
 
